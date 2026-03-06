@@ -16,8 +16,8 @@ Organised into:
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any
-from pydantic import BaseModel, Field
+from typing import Any, Union
+from pydantic import BaseModel, Field, field_validator
 
 
 # ── Enums ─────────────────────────────────────────────────────────────────────
@@ -101,12 +101,41 @@ class SizingInfo(BaseModel):
     ha_model: str = ""
 
 
+def _coerce_to_str_list(v: Any) -> list[str]:
+    """
+    GPT-4o sometimes returns BOQ items as dicts like:
+      {"part_number": "NX-3155G", "description": "...", "qty": 8, "total": 680000}
+    instead of plain strings. This validator flattens any such dict into a
+    human-readable string so Pydantic validation never fails.
+    """
+    if not isinstance(v, list):
+        return []
+    result = []
+    for item in v:
+        if isinstance(item, str):
+            result.append(item)
+        elif isinstance(item, dict):
+            # Build "KEY: value | KEY: value" style string from dict fields
+            parts = []
+            for k, val in item.items():
+                parts.append(f"{k}: {val}")
+            result.append(" | ".join(parts))
+        else:
+            result.append(str(item))
+    return result
+
+
 class BOQInfo(BaseModel):
     hardware: list[str] = []
     software: list[str] = []
     licenses: list[str] = []
     support: list[str] = []
     services: list[str] = []
+
+    @field_validator("hardware", "software", "licenses", "support", "services", mode="before")
+    @classmethod
+    def coerce_items_to_strings(cls, v: Any) -> list[str]:
+        return _coerce_to_str_list(v)
 
 
 class CommercialInfo(BaseModel):
