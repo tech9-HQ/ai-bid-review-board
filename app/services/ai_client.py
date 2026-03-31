@@ -1,199 +1,215 @@
 """
 app/services/ai_client.py
-──────────────────────────
-Thin, reusable wrappers around OpenAI and Anthropic SDKs.
+─────────────────────────
+Claude API client supporting two backends:
 
-Both clients:
-  - Accept a system prompt + user prompt
-  - Return parsed dict (from JSON response)
-  - Raise AIProviderError / AIResponseParseError on failure
-  - Log token usage for cost tracking
+  AI_BACKEND=anthropic  →  Direct Anthropic API  (uses ANTHROPIC_API_KEY)
+  AI_BACKEND=bedrock    →  AWS Bedrock            (uses AWS_ACCESS_KEY_ID +
+                                                   AWS_SECRET_ACCESS_KEY +
+                                                   AWS_REGION)
+
+The rest of the codebase is completely unaware of which backend is active.
+All pipeline stages call claude_client.complete() and claude_client.complete_json()
+exactly the same way regardless of backend.
+
+Bedrock differences handled here:
+  - Uses anthropic.AsyncAnthropicBedrock instead of AsyncAnthropic
+  - Model IDs follow Bedrock's cross-region inference profile format
+  - AWS credentials are passed directly (no boto3 session needed)
+  - Bedrock raises the same anthropic.* exception types — retry logic unchanged
 """
 from __future__ import annotations
 
-import json
-import re
-from typing import Any
+from typing import Optional
 
+import anthropic
 from loguru import logger
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from app.core.config import settings
-from app.core.exceptions import AIProviderError, AIResponseParseError
+from app.core.exceptions import AIProviderError
 
 
-def _strip_fences(text: str) -> str:
-    """Remove ```json ... ``` or ``` ... ``` markdown fences."""
-    return re.sub(r"```(?:json)?\s*|\s*```", "", text).strip()
-
-
-def _parse_json_response(raw: str, context: str) -> dict[str, Any]:
+def _build_client() -> anthropic.AsyncAnthropic | anthropic.AsyncAnthropicBedrock:
     """
-    Attempt to parse LLM output as JSON.
-    Raises AIResponseParseError with full raw output on failure.
+    Build the correct async Anthropic client based on AI_BACKEND setting.
+
+    Called once at module load — the result is cached as `claude_client`.
     """
-    cleaned = _strip_fences(raw)
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        logger.error(f"[{context}] JSON parse failed:\n{cleaned[:500]}")
-        raise AIResponseParseError(
-            f"AI returned invalid JSON during {context}.",
-            detail=f"Parse error: {exc}. Raw (first 500 chars): {cleaned[:500]}",
-        ) from exc
-
-
-# ── OpenAI Client ─────────────────────────────────────────────────────────────
-
-class OpenAIClient:
-    def __init__(self) -> None:
-        from openai import OpenAI, APIError, RateLimitError, APITimeoutError
-        self._client = OpenAI(api_key=settings.OPENAI_API_KEY)
-        self._APIError = APIError
-        self._RateLimitError = RateLimitError
-        self._APITimeoutError = APITimeoutError
-
-    def chat(
-        self,
-        system: str,
-        user: str,
-        model: str | None = None,
-        temperature: float | None = None,
-        max_tokens: int | None = None,
-        context: str = "openai",
-    ) -> dict[str, Any]:
-        """
-        Call OpenAI chat completion and return parsed JSON dict.
-        """
-        _model = model or settings.OPENAI_AUDIT_MODEL
-        _temp = temperature if temperature is not None else settings.AI_TEMPERATURE
-        _max_tokens = max_tokens or settings.AI_MAX_TOKENS
-
-        logger.info(f"[OpenAI] {context} | model={_model} | temp={_temp}")
-
-        try:
-            response = self._client.chat.completions.create(
-                model=_model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=_temp,
-                max_tokens=_max_tokens,
-                response_format={"type": "json_object"},  # Force JSON mode
-            )
-        except self._RateLimitError as exc:
-            raise AIProviderError("OpenAI rate limit reached.", detail=str(exc)) from exc
-        except self._APITimeoutError as exc:
-            raise AIProviderError("OpenAI request timed out.", detail=str(exc)) from exc
-        except self._APIError as exc:
-            raise AIProviderError(f"OpenAI API error: {exc.message}", detail=str(exc)) from exc
-
-        raw = response.choices[0].message.content or ""
-
-        # Log token usage
-        usage = response.usage
-        if usage:
-            logger.info(
-                f"[OpenAI] {context} | "
-                f"prompt_tokens={usage.prompt_tokens} | "
-                f"completion_tokens={usage.completion_tokens} | "
-                f"total={usage.total_tokens}"
-            )
-
-        return _parse_json_response(raw, context)
-
-    def chat_text(
-        self,
-        system: str,
-        user: str,
-        model: str | None = None,
-        temperature: float | None = None,
-        max_tokens: int | None = None,
-        context: str = "openai",
-    ) -> str:
-        """Call OpenAI and return raw text (no JSON parsing)."""
-        _model = model or settings.OPENAI_AUDIT_MODEL
-        _temp = temperature if temperature is not None else settings.AI_TEMPERATURE
-        _max_tokens = max_tokens or settings.AI_MAX_TOKENS
-
-        try:
-            response = self._client.chat.completions.create(
-                model=_model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=_temp,
-                max_tokens=_max_tokens,
-            )
-        except Exception as exc:
-            raise AIProviderError(f"OpenAI error: {exc}", detail=str(exc)) from exc
-
-        return response.choices[0].message.content or ""
-
-
-# ── Anthropic (Claude) Client ─────────────────────────────────────────────────
-
-class AnthropicClient:
-    def __init__(self) -> None:
-        if not settings.ANTHROPIC_API_KEY:
-            # Deferred — client unusable until key is provided
-            self._client = None
-            self._anthropic = None
-            return
-        import anthropic
-        self._client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-        self._anthropic = anthropic
-
-    def is_available(self) -> bool:
-        return self._client is not None
-
-    def chat(
-        self,
-        system: str,
-        user: str,
-        model: str | None = None,
-        temperature: float | None = None,
-        max_tokens: int | None = None,
-        context: str = "claude",
-    ) -> dict[str, Any]:
-        """
-        Call Claude and return parsed JSON dict.
-        """
-        if not self.is_available():
-            raise AIProviderError(
-                "Anthropic API key not configured. Set ANTHROPIC_API_KEY in .env to enable Stage 5 legal review.",
-                detail="ANTHROPIC_API_KEY is missing or empty.",
-            )
-        _model = model or settings.CLAUDE_LEGAL_MODEL
-        _temp = temperature if temperature is not None else settings.AI_TEMPERATURE
-        _max_tokens = max_tokens or settings.AI_MAX_TOKENS
-
-        logger.info(f"[Claude] {context} | model={_model} | temp={_temp}")
-
-        try:
-            response = self._client.messages.create(
-                model=_model,
-                max_tokens=_max_tokens,
-                system=system,
-                messages=[{"role": "user", "content": user}],
-                temperature=_temp,
-            )
-        except self._anthropic.RateLimitError as exc:
-            raise AIProviderError("Anthropic rate limit reached.", detail=str(exc)) from exc
-        except self._anthropic.APITimeoutError as exc:
-            raise AIProviderError("Anthropic request timed out.", detail=str(exc)) from exc
-        except self._anthropic.APIError as exc:
-            raise AIProviderError(f"Anthropic API error: {exc}", detail=str(exc)) from exc
-
-        raw = response.content[0].text if response.content else ""
-
-        # Log token usage
-        usage = response.usage
+    if settings.using_bedrock:
         logger.info(
-            f"[Claude] {context} | "
-            f"input_tokens={usage.input_tokens} | "
-            f"output_tokens={usage.output_tokens}"
+            f"AI backend: AWS Bedrock | region={settings.AWS_REGION} | "
+            f"fast_model={settings.CLAUDE_FAST_MODEL}"
+        )
+        return anthropic.AsyncAnthropicBedrock(
+            aws_access_key=settings.AWS_ACCESS_KEY_ID,
+            aws_secret_key=settings.AWS_SECRET_ACCESS_KEY,
+            aws_region=settings.AWS_REGION,
+        )
+    else:
+        logger.info(
+            f"AI backend: Anthropic direct | "
+            f"fast_model={settings.CLAUDE_FAST_MODEL}"
+        )
+        return anthropic.AsyncAnthropic(
+            api_key=settings.ANTHROPIC_API_KEY,
         )
 
-        return _parse_json_response(raw, context)
+
+class ClaudeClient:
+    """
+    Unified async wrapper around the Anthropic SDK.
+
+    Works identically whether the underlying client points at
+    Anthropic's API or AWS Bedrock. All retry logic, token logging,
+    and error normalisation live here.
+    """
+
+    def __init__(self) -> None:
+        self._client = _build_client()
+        self._backend = settings.AI_BACKEND
+
+    @retry(
+        retry=retry_if_exception_type(
+            (anthropic.RateLimitError, anthropic.InternalServerError)
+        ),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        stop=stop_after_attempt(4),
+        reraise=True,
+    )
+    async def complete(
+        self,
+        prompt: str,
+        system: Optional[str] = None,
+        model: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> str:
+        """
+        Send a single-turn completion to Claude (Anthropic or Bedrock).
+
+        Args:
+            prompt:      User message.
+            system:      Optional system prompt.
+            model:       Model ID. Defaults to CLAUDE_FAST_MODEL.
+                         Must match the backend format:
+                           anthropic → "claude-sonnet-4-6"
+                           bedrock   → "us.anthropic.claude-sonnet-4-6-20251115-v1:0"
+            max_tokens:  Override. Defaults to AI_MAX_TOKENS.
+            temperature: Override. Defaults to AI_TEMPERATURE.
+
+        Returns:
+            Assistant text response as a string.
+
+        Raises:
+            AIProviderError: On unrecoverable API errors.
+        """
+        _model       = model       or settings.CLAUDE_FAST_MODEL
+        _max_tokens  = max_tokens  or settings.AI_MAX_TOKENS
+        _temperature = temperature if temperature is not None else settings.AI_TEMPERATURE
+
+        kwargs: dict = {
+            "model":      _model,
+            "max_tokens": _max_tokens,
+            "temperature": _temperature,
+            "messages":   [{"role": "user", "content": prompt}],
+        }
+        if system:
+            kwargs["system"] = system
+
+        try:
+            logger.debug(
+                f"Claude request | backend={self._backend} "
+                f"model={_model} max_tokens={_max_tokens}"
+            )
+            response = await self._client.messages.create(**kwargs)
+
+            usage = response.usage
+            logger.info(
+                f"Claude response | backend={self._backend} model={_model} "
+                f"input_tokens={usage.input_tokens} "
+                f"output_tokens={usage.output_tokens}"
+            )
+
+            return "\n".join(
+                block.text
+                for block in response.content
+                if block.type == "text"
+            )
+
+        except anthropic.AuthenticationError as exc:
+            if self._backend == "bedrock":
+                logger.error(
+                    "AWS Bedrock authentication failed. "
+                    "Check AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY."
+                )
+                raise AIProviderError(
+                    "AWS authentication failed. Verify your Access Key and Secret."
+                ) from exc
+            else:
+                logger.error("Anthropic authentication failed — check ANTHROPIC_API_KEY")
+                raise AIProviderError("Authentication failed with Claude API") from exc
+
+        except anthropic.PermissionDeniedError as exc:
+            # Bedrock: model not enabled in your AWS account / region
+            logger.error(
+                f"Permission denied on model {_model}. "
+                "For Bedrock, ensure the model is enabled in your AWS console "
+                "under Bedrock > Model Access."
+            )
+            raise AIProviderError(
+                f"Access denied to model {_model}. "
+                "Enable it in AWS Bedrock > Model Access."
+            ) from exc
+
+        except anthropic.BadRequestError as exc:
+            logger.error(f"Claude bad request: {exc}")
+            raise AIProviderError(f"Invalid request to Claude API: {exc}") from exc
+
+        except (anthropic.RateLimitError, anthropic.InternalServerError):
+            # Caught by tenacity for retry — re-raise after exhaustion
+            raise
+
+        except anthropic.APIError as exc:
+            logger.error(f"Claude API error ({self._backend}): {exc}")
+            raise AIProviderError(f"Claude API error: {exc}") from exc
+
+    async def complete_json(
+        self,
+        prompt: str,
+        system: Optional[str] = None,
+        model: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        """
+        Completion that enforces JSON-only output.
+        Appends a strict JSON instruction to the system prompt.
+
+        Returns raw JSON string — caller is responsible for parsing.
+        """
+        json_instruction = (
+            "You must respond with valid JSON only. "
+            "Do not include markdown code fences, preamble, "
+            "or any text outside the JSON object."
+        )
+        combined_system = (
+            f"{system}\n\n{json_instruction}" if system else json_instruction
+        )
+
+        return await self.complete(
+            prompt=prompt,
+            system=combined_system,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=0.0,  # Zero temperature for deterministic structured output
+        )
+
+
+# ── Module-level singleton ─────────────────────────────────────────────────
+# Built once at import time — backend determined by AI_BACKEND env var.
+claude_client = ClaudeClient()

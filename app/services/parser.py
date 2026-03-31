@@ -213,3 +213,26 @@ def truncate_text(text: str, max_chars: int = 12000) -> str:
         + f"\n\n[... TRUNCATED — {len(text) - max_chars} chars omitted ...]\n\n"
         + text[-half:]
     )
+
+class DocumentParser:
+    """Handles file parsing"""
+
+    async def parse(self, uploaded_files: dict) -> dict:
+        parsed = {}
+
+        for key, file in uploaded_files.items():
+            if not file:
+                parsed[key] = ""
+                continue
+
+            try:
+                # file is UploadFile → correct handling
+                content = await file.read()
+                text = content.decode("utf-8", errors="ignore")
+
+                parsed[key] = text
+
+            except Exception:
+                parsed[key] = ""
+
+        return parsed

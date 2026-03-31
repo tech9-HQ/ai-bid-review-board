@@ -348,3 +348,12 @@ def _cell(table, row: int, col: int, text: str, bold: bool = False) -> None:
     if bold:
         for run in cell.paragraphs[0].runs:
             run.bold = True
+
+class OutputGenerator:
+    """Wrapper class for Stage 6 document generation."""
+
+    def __init__(self):
+        pass
+
+    def generate(self, session: ReviewSession) -> dict[str, str]:
+        return generate_all_outputs(session)

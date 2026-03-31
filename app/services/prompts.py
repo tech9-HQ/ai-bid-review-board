@@ -1,302 +1,231 @@
 """
 app/services/prompts.py
 ────────────────────────
-All AI prompts for the Bid Review Board pipeline.
+All AI prompts for the bid review pipeline.
 
-Keeping prompts separate from business logic makes them easy to
-version, test, and iterate without touching service code.
+Design principles:
+  - System prompts define persona and output contract.
+  - User prompts inject document content via XML tags (<document> blocks).
+  - All structured-output prompts specify exact JSON schema in the system prompt.
+  - Claude-specific: uses XML tags for document injection (better than plain
+    text for Claude's attention mechanism).
+  - Versioned in this file — change prompt behaviour here, not in evaluator.py.
 """
 from __future__ import annotations
 
-import json
-from app.models.schemas import BidBundle, AUDIT_AREAS
+from typing import Any, Dict, Optional
+
+from app.models.schemas import AuditResult, BidBundle
 
 
-# ── Stage 2: Bid Bundle Extraction ───────────────────────────────────────────
+class BidPrompts:
+    """
+    Container for all pipeline prompts.
+    System prompts are class-level constants.
+    Builder methods construct user-turn prompts with document content.
+    """
 
-BID_BUNDLE_SYSTEM = """You are a senior solution architect and commercial analyst.
-Extract structured deal intelligence from raw proposal documents.
-Return ONLY valid JSON. No markdown fences. No commentary."""
+    # ── System Prompts ─────────────────────────────────────────────────────
 
-BID_BUNDLE_SCHEMA = json.dumps(
+    BUNDLE_SYSTEM = """You are a senior pre-sales architect at a technology solutions company.
+Your task is to read a set of deal documents and extract a structured bid bundle summary.
+
+Output a single JSON object with this exact schema:
+{
+  "deal_name": "string",
+  "customer": "string",
+  "solution_summary": "string (2-3 sentences)",
+  "architecture_components": ["string"],
+  "total_value_usd": number_or_null,
+  "delivery_timeline_weeks": number_or_null,
+  "key_risks": ["string"],
+  "assumptions": ["string"],
+  "exclusions": ["string"],
+  "requirements_coverage": {
+    "covered": ["string"],
+    "gaps": ["string"]
+  }
+}
+
+Be precise and factual. Extract only what is stated in the documents."""
+
+    AUDIT_SYSTEM = """You are a bid governance auditor. Your role is to identify issues that would
+block or conditionally approve a proposal before it reaches a customer.
+
+Evaluate across exactly 10 areas. For each issue found, assign one severity:
+  BLOCKER  — must be fixed before submission
+  MAJOR    — should be fixed; affects score significantly
+  MINOR    — improvement recommended
+
+Output a single JSON object with this exact schema:
+{
+  "scorecard": {
+    "overall_score": integer_0_to_100,
+    "blocker_count": integer,
+    "major_count": integer,
+    "minor_count": integer,
+    "areas": [
+      {
+        "id": "string (e.g. GOV-01)",
+        "name": "string",
+        "score": integer_0_to_10,
+        "status": "pass|warn|fail"
+      }
+    ]
+  },
+  "issues": [
     {
-        "deal": {
-            "customer": "",
-            "industry": "",
-            "locations": [],
-            "business_objective": "",
-            "pain_points": [],
-            "success_criteria": [],
-            "timeline": "",
-            "budget_signals": ""
-        },
-        "requirements": {
-            "must_have": [],
-            "should_have": [],
-            "constraints": [],
-            "compliance": []
-        },
-        "solution": {
-            "architecture_type": "",
-            "technologies": [],
-            "dependencies": [],
-            "assumptions": [],
-            "exclusions": []
-        },
-        "sizing": {
-            "workload_type": "",
-            "vm_count": 0,
-            "cpu_ratio": "",
-            "memory_gb": 0,
-            "storage_usable_tb": 0,
-            "iops": 0,
-            "growth_pct": 0,
-            "ha_model": ""
-        },
-        "boq": {
-            "hardware": [],
-            "software": [],
-            "licenses": [],
-            "support": [],
-            "services": []
-        },
-        "commercials": {
-            "deal_value": "",
-            "discount_pct": 0,
-            "margin_pct": 0,
-            "payment_terms": "",
-            "validity_days": 0
-        },
-        "sow": {
-            "deliverables": [],
-            "milestones": [],
-            "acceptance_criteria": [],
-            "customer_responsibilities": []
-        },
-        "tnc": {
-            "liability_cap": "",
-            "warranty": "",
-            "sla_summary": "",
-            "penalties": "",
-            "change_control": ""
-        }
-    },
-    indent=2
-)
+      "id": "string (e.g. INF-SIZ-004)",
+      "area": "string",
+      "severity": "BLOCKER|MAJOR|MINOR",
+      "finding": "string — what is wrong",
+      "fix": "string — what to do",
+      "reference_doc": "string — which document this was found in"
+    }
+  ],
+  "executive_summary": "string (3-5 sentences for board)"
+}"""
 
+    REWRITE_SYSTEM = """You are a senior technical writer at a technology solutions company.
+You will receive a draft proposal and a list of governance issues that must be addressed.
+Rewrite the proposal in clean, professional English, incorporating all required fixes.
 
-def build_bid_bundle_prompt(documents: dict[str, str]) -> str:
-    docs_text = "\n\n".join(
-        f"=== {label.upper()} ===\n{content}"
-        for label, content in documents.items()
-        if content.strip()
-    )
-    return f"""Extract structured deal intelligence from the following documents.
+Output the revised proposal as structured text with clear section headings.
+Do not include JSON. Do not mention the audit or governance process in the output.
+Write as if this is the original polished proposal."""
 
-Return a single JSON object matching this exact schema:
-{BID_BUNDLE_SCHEMA}
+    LEGAL_SYSTEM = """You are a technology contracts lawyer specialising in IT services agreements.
+Review the provided legal documents (SOW, T&C, commercial terms) for risk clauses.
 
-Fill every field as accurately as possible from the documents.
-Use empty strings / empty arrays where information is not available.
-Do NOT invent information not present in the documents.
-
-DOCUMENTS:
-{docs_text}"""
-
-
-# ── Stage 3: Governance Audit ─────────────────────────────────────────────────
-
-AUDIT_SYSTEM = """You are the Tech9Labs AI Bid Review Board.
-You act simultaneously as: Delivery Head, Chief Architect, Commercial Controller, and Solution Assurance Director.
-
-Your job is to PREVENT proposals from reaching customers with errors, oversell, undersizing, or legal risk.
-Be strict. Be evidence-based. Do NOT summarise. Do NOT be polite.
-
-Return ONLY valid JSON. No markdown. No commentary outside JSON."""
-
-AUDIT_SCHEMA = json.dumps(
+Output a single JSON object with this exact schema:
+{
+  "summary": "string (2-3 sentences)",
+  "risk_level": "low|medium|high|critical",
+  "clauses": [
     {
-        "scorecard": {
-            "areas": [
-                {
-                    "area": "<area name>",
-                    "verdict": "PASS | REVIEW | BLOCKER",
-                    "score": 0,
-                    "issue_count": 0,
-                    "notes": ""
-                }
-            ],
-            "overall_score": 0,
-            "blocker_count": 0,
-            "recommendation": "Go | Conditional Go | No Go",
-            "clarifying_questions": []
-        },
-        "issues": [
-            {
-                "id": "CAT-SUB-NNN",
-                "category": "Sizing | Architecture | BOQ | Legal | Commercial | Scope | Delivery | Business Fit | Requirements | Operability",
-                "severity": "BLOCKER | HIGH | MEDIUM | LOW | INFO",
-                "finding": "",
-                "evidence": "",
-                "impact": "",
-                "fix": "",
-                "owner": "Presales | Delivery | Legal | Commercial",
-                "status": "Open"
-            }
-        ]
-    },
-    indent=2
-)
-
-
-def build_audit_prompt(bid_bundle: BidBundle, documents: dict[str, str]) -> str:
-    bundle_json = bid_bundle.model_dump_json(indent=2)
-
-    docs_summary = "\n\n".join(
-        f"=== {label.upper()} ===\n{content[:3000]}"
-        for label, content in documents.items()
-        if content.strip()
-    )
-
-    areas_list = "\n".join(f"- {a}" for a in AUDIT_AREAS)
-
-    return f"""Perform a full governance audit of this proposal.
-
-AUDIT AREAS (check ALL of these):
-{areas_list}
-
-AUDIT INSTRUCTIONS:
-1. Cross-verify CRM promises vs proposal vs SOW vs BOQ vs sizing.
-2. Detect missing scope, missing deliverables, hidden dependencies.
-3. Validate architecture supports stated HA, DR, performance, scalability.
-4. Validate sizing headroom, CPU ratio, memory, storage, and growth assumptions.
-5. Verify BOQ contains every required component mentioned in SOW or solution.
-6. Identify commercial risks: margin, payment exposure, discount.
-7. Identify legal and SLA risks: liability caps, penalty clauses, ambiguous language.
-8. Identify customer expectation mismatches.
-9. Provide structured findings ONLY with direct evidence from documents.
-
-SCORING (per area):
-- 90–100: No issues
-- 75–89: Minor gaps
-- 60–74: Moderate gaps, REVIEW required
-- Below 60: Significant failure, BLOCKER
-
-ISSUE ID FORMAT: <CATEGORY_CODE>-<SUB>-<NNN>
-Examples: INF-SIZ-001, ARCH-HA-002, LEG-SLA-003, COM-BOQ-004
-
-BID BUNDLE (structured deal data):
-{bundle_json}
-
-DOCUMENT CONTENT:
-{docs_summary}
-
-Return JSON matching this schema exactly:
-{AUDIT_SCHEMA}"""
-
-
-# ── Stage 4: Proposal Rewrite ─────────────────────────────────────────────────
-
-REWRITE_SYSTEM = """You are the Lead Solution Architect and Delivery Director at Tech9Labs.
-Rewrite and fix proposal sections based on audit findings.
-Write customer-ready, professional text suitable for direct inclusion in a formal proposal.
-Return ONLY valid JSON. No markdown fences."""
-
-REWRITE_SCHEMA = json.dumps(
+      "clause_ref": "string",
+      "document": "string",
+      "risk_type": "liability|sla|payment|ip|termination|other",
+      "risk_level": "low|medium|high|critical",
+      "description": "string",
+      "recommendation": "string"
+    }
+  ],
+  "recommended_changes": [
     {
-        "executive_summary": "",
-        "solution_approach": "",
-        "architecture_justification": "",
-        "sizing_assumptions": "",
-        "scope_and_deliverables": "",
-        "milestones_and_acceptance": "",
-        "dependencies": "",
-        "commercial_clarifications": "",
-        "assumptions_and_exclusions": ""
-    },
-    indent=2
-)
+      "clause_ref": "string",
+      "current_text_summary": "string",
+      "proposed_change": "string",
+      "rationale": "string"
+    }
+  ],
+  "show_stoppers": ["string"]
+}"""
 
+    # ── User Prompt Builders ───────────────────────────────────────────────
 
-def build_rewrite_prompt(
-    bid_bundle: BidBundle,
-    audit_issues: list,
-    original_proposal: str,
-) -> str:
-    bundle_json = bid_bundle.model_dump_json(indent=2)
+    def build_bundle(self, extracted: Dict[str, str], deal_name: str) -> str:
+        """Build Stage 2 user prompt — bid bundle extraction."""
+        doc_block = self._format_documents(extracted)
+        return f"""Deal name: {deal_name}
 
-    issues_text = "\n".join(
-        f"[{i.severity.value}] {i.id} — {i.finding}\n  Fix: {i.fix}"
-        for i in audit_issues
-    )
+Analyse the following deal documents and extract a structured bid bundle.
 
-    return f"""Rewrite the proposal sections to fix all identified issues.
+{doc_block}
 
-ISSUES TO FIX:
-{issues_text}
+Return the JSON bid bundle object."""
 
-DEAL CONTEXT (Bid Bundle):
-{bundle_json}
+    def governance_audit(self, bundle: BidBundle, extracted: Dict[str, str]) -> str:
+        """Build Stage 3 user prompt — governance audit."""
+        doc_block = self._format_documents(extracted)
+        return f"""Bid bundle summary:
+<bid_bundle>
+{bundle.model_dump_json(indent=2)}
+</bid_bundle>
 
-ORIGINAL PROPOSAL (for reference):
-{original_proposal[:4000]}
+Full document set:
+{doc_block}
 
-INSTRUCTIONS:
-- Fix every issue in the rewrite.
-- Write in formal, customer-facing English.
-- Be specific — include actual sizing numbers, architecture names, milestones.
-- Do NOT add fluff or generic consulting language.
-- Each section should be 2–5 concise paragraphs.
+The 10 governance areas to evaluate are:
+1. Business Fit — do pain points map to the proposed solution?
+2. Requirements Traceability — every requirement is covered or explicitly excluded
+3. Architecture Integrity — HA, DR, performance, scalability validated
+4. Sizing Validity — CPU/memory/storage ratios, growth headroom
+5. BOQ Consistency — all solution components appear in the BOQ
+6. Scope Completeness — all deliverables explicitly defined
+7. Delivery Risk — dependencies and assumptions declared
+8. Commercial Safety — margin, payment terms, discount policy
+9. Legal Risk — SLA caps, liability clauses, penalty exposure
+10. Operability — support model, monitoring, handover plan
 
-Return JSON matching this schema exactly:
-{REWRITE_SCHEMA}"""
+Return the JSON audit result object."""
 
+    def rewrite_proposal(
+        self,
+        bundle: BidBundle,
+        audit: AuditResult,
+        extracted: Dict[str, str],
+    ) -> str:
+        """Build Stage 4 user prompt — proposal rewrite."""
+        original = extracted.get("proposal", "")
+        issues_json = [i.model_dump() for i in audit.issues]
 
-# ── Stage 5: Legal Review (Claude) ────────────────────────────────────────────
+        return f"""Original proposal:
+<original_proposal>
+{original[:8000]}
+</original_proposal>
 
-LEGAL_SYSTEM = """You are a senior technology contract reviewer specialising in IT services and infrastructure delivery agreements.
-Your job is to rewrite contract clauses to be legally safe, unambiguous, and fair — while remaining customer-friendly.
-Return ONLY valid JSON. No markdown. No preamble."""
+Governance issues to address:
+<issues>
+{issues_json}
+</issues>
 
-LEGAL_SCHEMA = json.dumps(
-    {
-        "revised_sla_clause": "",
-        "revised_liability_clause": "",
-        "revised_change_control": "",
-        "revised_acceptance_criteria": "",
-        "revised_warranty_clause": "",
-        "additional_recommendations": []
-    },
-    indent=2
-)
+Bid bundle context:
+<context>
+Deal: {bundle.deal_name}
+Customer: {bundle.customer}
+Solution: {bundle.solution_summary}
+</context>
 
+Rewrite the proposal incorporating all fixes. Maintain professional tone throughout."""
 
-def build_legal_prompt(bid_bundle: BidBundle, documents: dict[str, str]) -> str:
-    bundle_json = bid_bundle.model_dump_json(indent=2)
+    def legal_review(
+        self,
+        sow_text: str,
+        tnc_text: str,
+        commercial_text: str,
+    ) -> str:
+        """Build Stage 5 user prompt — legal review."""
+        parts = []
+        if sow_text:
+            parts.append(f"<sow>\n{sow_text[:6000]}\n</sow>")
+        if tnc_text:
+            parts.append(f"<terms_and_conditions>\n{tnc_text[:6000]}\n</terms_and_conditions>")
+        if commercial_text:
+            parts.append(f"<commercial_terms>\n{commercial_text[:4000]}\n</commercial_terms>")
 
-    sow_text = documents.get("sow", "")
-    tnc_text = documents.get("tnc", documents.get("terms", ""))
+        docs = "\n\n".join(parts)
+        return f"""Review the following contract documents for legal and commercial risk.
 
-    return f"""Review and rewrite the SOW and Terms & Conditions clauses.
+{docs}
 
-REWRITE OBJECTIVES:
-1. Remove all ambiguity from SLA definitions.
-2. Add a limitation of liability clause capped at contract value.
-3. Define clear change request / change control process.
-4. Define unambiguous acceptance criteria with sign-off timelines.
-5. Tighten warranty language to specific duration and scope.
-6. Cap SLA penalty credits at maximum 10% of annual contract value.
-7. Ensure customer responsibilities are clearly listed to protect Tech9Labs.
-8. Make language customer-friendly but legally protective.
+Identify all risk clauses and return the JSON legal review object."""
 
-DEAL CONTEXT:
-{bundle_json}
+    # ── Helpers ────────────────────────────────────────────────────────────
 
-SOW TEXT:
-{sow_text[:3000] if sow_text else "Not provided — generate standard clauses based on deal context."}
+    @staticmethod
+    def _format_documents(extracted: Dict[str, str]) -> str:
+        """
+        Format extracted document text into Claude-friendly XML blocks.
+        Truncates very long documents to stay within context limits.
+        """
+        MAX_CHARS_PER_DOC = 8000
+        blocks = []
+        for doc_type, content in extracted.items():
+            if content and content.strip():
+                truncated = content[:MAX_CHARS_PER_DOC]
+                if len(content) > MAX_CHARS_PER_DOC:
+                    truncated += f"\n[... truncated — {len(content) - MAX_CHARS_PER_DOC} chars omitted ...]"
+                blocks.append(f"<{doc_type}>\n{truncated}\n</{doc_type}>")
 
-TERMS & CONDITIONS:
-{tnc_text[:3000] if tnc_text else "Not provided — generate standard clauses based on deal context."}
-
-Return JSON matching this schema exactly:
-{LEGAL_SCHEMA}"""
+        return "\n\n".join(blocks) if blocks else "<documents>No documents provided.</documents>"

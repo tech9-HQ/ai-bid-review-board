@@ -35,8 +35,7 @@ from loguru import logger
 
 from app.core.config import settings
 from app.models.schemas import (
-    EvaluateResponse,
-    GenerateDocsResponse,
+    EvaluationResponse,
 )
 from app.services.evaluator import BidReviewPipeline, _session_store
 from app.utils.file_utils import read_upload_file, sanitise_deal_name
@@ -58,7 +57,7 @@ async def health_check() -> dict:
 
 # ── Evaluate (Stages 1-5, results only) ──────────────────────────────────────
 
-@router.post("/evaluate/", response_model=EvaluateResponse, tags=["Evaluation"])
+@router.post("/evaluate/", response_model=EvaluationResponse, tags=["Evaluation"])
 async def evaluate(
     deal_name: str = Form(..., description="Customer / deal name"),
     crm: UploadFile = File(..., description="CRM snapshot (PDF/DOCX/TXT)"),
@@ -107,7 +106,7 @@ async def evaluate(
 
     session = await pipeline.run(deal_name, uploaded)
 
-    return EvaluateResponse(
+    return EvaluationResponse(
         success=True,
         session_id=session.session_id,
         deal_name=session.deal_name,
@@ -125,7 +124,6 @@ async def evaluate(
 
 @router.post(
     "/sessions/{session_id}/generate-docs/",
-    response_model=GenerateDocsResponse,
     tags=["Documents"],
 )
 async def generate_docs(session_id: str):
@@ -150,16 +148,16 @@ async def generate_docs(session_id: str):
         for role, path in session.output_files.items()
     }
 
-    return GenerateDocsResponse(
-        success=True,
-        session_id=session.session_id,
-        output_files=output_urls,
-    )
+    return {
+    "success": True,
+    "session_id": session.session_id,
+    "output_files": output_urls,
+}
 
 
 # ── Get Session Results ────────────────────────────────────────────────────────
 
-@router.get("/sessions/{session_id}/", response_model=EvaluateResponse, tags=["Evaluation"])
+@router.get("/sessions/{session_id}/", response_model=EvaluationResponse, tags=["Evaluation"])
 async def get_session(session_id: str):
     """
     Retrieve the results of a previous review session by ID.
@@ -179,7 +177,7 @@ async def get_session(session_id: str):
             },
         )
 
-    return EvaluateResponse(
+    return EvaluationResponse(
         success=True,
         session_id=session.session_id,
         deal_name=session.deal_name,

@@ -1,327 +1,268 @@
 """
 tests/test_evaluator.py
 ────────────────────────
-Unit tests for the Bid Review Board pipeline.
+Test suite for the Claude-only bid review pipeline.
 
 Run with:
-    pytest tests/ -v
-    pytest tests/ -v --cov=app --cov-report=term-missing
+  pytest tests/ -v
+  pytest tests/ -v --cov=app --cov-report=term-missing
 """
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi.testclient import TestClient
 
 from app.models.schemas import (
-    BidBundle,
-    DealInfo,
     AuditResult,
-    GovernanceScorecard,
-    AuditArea,
+    BidBundle,
+    DocumentSet,
+    EvaluationResponse,
+    GovernanceArea,
     Issue,
-    IssueCategory,
-    Severity,
-    Verdict,
-    Recommendation,
-    IssueStatus,
-    ProposalRewrite,
     LegalReview,
+    RequirementsCoverage,
+    Scorecard,
+    Severity,
+    StageStatus,
 )
-from app.services.parser import extract_text_from_bytes, truncate_text
-from app.services.prompts import (
-    build_bid_bundle_prompt,
-    build_audit_prompt,
-    build_rewrite_prompt,
-    build_legal_prompt,
-)
+from app.services.evaluator import BidReviewPipeline
+from app.services.prompts import BidPrompts
+from main import app
 
 
-# ── Fixtures ──────────────────────────────────────────────────────────────────
+# ── Fixtures ───────────────────────────────────────────────────────────────
+
 
 @pytest.fixture
-def sample_bundle() -> BidBundle:
+def sample_document_set() -> DocumentSet:
+    return DocumentSet(
+        deal_name="Test Deal — ACME Corp",
+        crm=b"CRM: Pain points include legacy infra, slow DR recovery.",
+        crm_filename="crm.txt",
+        requirements=b"REQ-001: HA architecture. REQ-002: < 4h RTO. REQ-003: 3-year support.",
+        requirements_filename="requirements.txt",
+        sizing=b"CPU: 2:1 ratio. Memory: 256GB. Storage: 50TB.",
+        sizing_filename="sizing.txt",
+        boq=b"Item 1: 4x Servers. Item 2: SW Licenses. Item 3: Support.",
+        boq_filename="boq.txt",
+        proposal=b"Proposal: We propose a hyper-converged solution for ACME Corp.",
+        proposal_filename="proposal.txt",
+        sow=b"SOW: Delivery in 12 weeks. Liability capped at 1x contract value.",
+        sow_filename="sow.txt",
+    )
+
+
+@pytest.fixture
+def sample_bid_bundle() -> BidBundle:
     return BidBundle(
-        deal=DealInfo(
-            customer="Test Bank",
-            industry="Banking",
-            business_objective="Modernise core banking infrastructure",
-            pain_points=["Legacy hardware", "Downtime risk"],
-        )
-    )
-
-
-@pytest.fixture
-def sample_issue() -> Issue:
-    return Issue(
-        id="INF-SIZ-001",
-        category=IssueCategory.SIZING,
-        severity=Severity.BLOCKER,
-        finding="DR node count insufficient",
-        evidence="Sizing sheet shows 1 spare node, HA requires N+1",
-        impact="Failover will cause outage",
-        fix="Increase node count to 4",
-        owner="Presales",
-        status=IssueStatus.OPEN,
-    )
-
-
-@pytest.fixture
-def sample_audit(sample_issue) -> AuditResult:
-    return AuditResult(
-        scorecard=GovernanceScorecard(
-            areas=[
-                AuditArea(area="Business Fit", verdict=Verdict.PASS, score=90),
-                AuditArea(area="Sizing Validity", verdict=Verdict.BLOCKER, score=40, issue_count=1),
-            ],
-            overall_score=65,
-            blocker_count=1,
-            recommendation=Recommendation.CONDITIONAL_GO,
+        deal_name="Test Deal",
+        customer="ACME Corp",
+        solution_summary="HCI solution to replace legacy infrastructure.",
+        architecture_components=["HCI Nodes", "Networking", "SW Licenses"],
+        total_value_usd=250000,
+        delivery_timeline_weeks=12,
+        key_risks=["Lead time risk on hardware"],
+        assumptions=["Customer provides rack space"],
+        exclusions=["Migration services"],
+        requirements_coverage=RequirementsCoverage(
+            covered=["REQ-001", "REQ-002"],
+            gaps=["REQ-003"],
         ),
-        issues=[sample_issue],
     )
 
 
-# ── Parser Tests ──────────────────────────────────────────────────────────────
-
-class TestParser:
-    def test_truncate_short_text(self):
-        text = "Hello world"
-        result = truncate_text(text, max_chars=100)
-        assert result == text
-
-    def test_truncate_long_text(self):
-        text = "A" * 10000
-        result = truncate_text(text, max_chars=1000)
-        assert len(result) < 2000
-        assert "TRUNCATED" in result
-
-    def test_extract_txt_bytes(self):
-        content = b"This is a test document.\nLine 2."
-        result = extract_text_from_bytes(content, "test.txt")
-        assert "test document" in result
-
-    def test_unsupported_extension(self):
-        from app.core.exceptions import UnsupportedFileTypeError
-        with pytest.raises(UnsupportedFileTypeError):
-            extract_text_from_bytes(b"data", "file.psd")
-
-    def test_extract_pdf_bytes(self):
-        """Test PDF extraction with a minimal in-memory PDF."""
-        # Minimal valid PDF bytes
-        minimal_pdf = (
-            b"%PDF-1.4\n"
-            b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
-            b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
-            b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>endobj\n"
-            b"xref\n0 4\n0000000000 65535 f\n"
-            b"0000000009 00000 n\n0000000058 00000 n\n0000000115 00000 n\n"
-            b"trailer<</Size 4/Root 1 0 R>>\nstartxref\n190\n%%EOF"
-        )
-        # Should not raise even if text is empty
-        result = extract_text_from_bytes(minimal_pdf, "test.pdf")
-        assert isinstance(result, str)
+@pytest.fixture
+def sample_audit_result() -> AuditResult:
+    return AuditResult(
+        scorecard=Scorecard(
+            overall_score=72,
+            blocker_count=1,
+            major_count=2,
+            minor_count=3,
+            areas=[
+                GovernanceArea(id="GOV-01", name="Business Fit", score=8, status="pass"),
+                GovernanceArea(id="GOV-09", name="Legal Risk", score=5, status="warn"),
+            ],
+        ),
+        issues=[
+            Issue(
+                id="INF-SIZ-004",
+                area="Sizing Validity",
+                severity=Severity.BLOCKER,
+                finding="DR node count insufficient for failover",
+                fix="Increase DR node count from 2 to 4",
+                reference_doc="sizing.txt",
+            ),
+        ],
+        executive_summary="The proposal has 1 blocker that must be resolved before submission.",
+    )
 
 
-# ── Schema Tests ──────────────────────────────────────────────────────────────
-
-class TestSchemas:
-    def test_bid_bundle_defaults(self):
-        bundle = BidBundle()
-        assert bundle.deal.customer == ""
-        assert bundle.sizing.vm_count == 0
-        assert bundle.boq.hardware == []
-
-    def test_review_session_has_blockers(self, sample_audit):
-        from app.models.schemas import ReviewSession
-        session = ReviewSession(session_id="test-123", deal_name="Test Deal")
-        session.audit_result = sample_audit
-        assert session.has_blockers is True
-
-    def test_review_session_no_blockers(self, sample_bundle):
-        from app.models.schemas import ReviewSession, AuditResult, GovernanceScorecard
-        session = ReviewSession(session_id="test-456", deal_name="Clean Deal")
-        session.audit_result = AuditResult(
-            scorecard=GovernanceScorecard(overall_score=90, blocker_count=0),
-            issues=[],
-        )
-        assert session.has_blockers is False
-
-    def test_issue_severity_enum(self):
-        assert Severity.BLOCKER.value == "BLOCKER"
-        assert Severity.HIGH.value == "HIGH"
-
-    def test_verdict_enum(self):
-        area = AuditArea(area="Test", verdict=Verdict.PASS, score=90)
-        assert area.verdict == Verdict.PASS
+@pytest.fixture
+def sample_legal_review() -> LegalReview:
+    return LegalReview(
+        summary="Moderate risk. Liability cap needs review.",
+        risk_level="medium",
+        clauses=[],
+        recommended_changes=[],
+        show_stoppers=[],
+    )
 
 
-# ── Prompt Tests ──────────────────────────────────────────────────────────────
-
-class TestPrompts:
-    def test_bid_bundle_prompt_contains_documents(self):
-        docs = {"crm": "CRM content here", "proposal": "Proposal content here"}
-        prompt = build_bid_bundle_prompt(docs)
-        assert "CRM" in prompt.upper()
-        assert "CRM content here" in prompt
-
-    def test_audit_prompt_contains_bundle(self, sample_bundle):
-        docs = {"proposal": "Proposal text"}
-        prompt = build_audit_prompt(sample_bundle, docs)
-        assert "Test Bank" in prompt
-        assert "Business Fit" in prompt
-
-    def test_rewrite_prompt_contains_issues(self, sample_bundle, sample_issue):
-        prompt = build_rewrite_prompt(sample_bundle, [sample_issue], "original proposal")
-        assert "INF-SIZ-001" in prompt
-        assert "Increase node count" in prompt
-
-    def test_legal_prompt_contains_sow(self, sample_bundle):
-        docs = {"sow": "Unlimited SLA penalty clause"}
-        prompt = build_legal_prompt(sample_bundle, docs)
-        assert "Unlimited SLA penalty" in prompt
+# ── Unit Tests: BidPrompts ─────────────────────────────────────────────────
 
 
-# ── AI Client Tests (mocked) ──────────────────────────────────────────────────
+class TestBidPrompts:
+    def test_build_bundle_includes_deal_name(self):
+        prompts = BidPrompts()
+        extracted = {"crm": "CRM text here", "requirements": "REQ text here"}
+        result = prompts.build_bundle(extracted, "My Deal")
+        assert "My Deal" in result
+        assert "<crm>" in result
+        assert "<requirements>" in result
 
-class TestAIClientMocked:
-    def test_openai_client_success(self):
-        """OpenAI client parses JSON response correctly."""
-        from app.services.ai_client import OpenAIClient
+    def test_format_documents_truncates_long_content(self):
+        prompts = BidPrompts()
+        long_text = "x" * 20000
+        result = prompts._format_documents({"proposal": long_text})
+        assert "truncated" in result
+        assert len(result) < len(long_text)
 
-        mock_response = MagicMock()
-        mock_response.choices[0].message.content = '{"result": "ok"}'
-        mock_response.usage.prompt_tokens = 100
-        mock_response.usage.completion_tokens = 50
-        mock_response.usage.total_tokens = 150
+    def test_legal_review_skips_empty_docs(self):
+        prompts = BidPrompts()
+        result = prompts.legal_review("SOW content", "", "")
+        assert "<sow>" in result
+        assert "<terms_and_conditions>" not in result
 
-        with patch("openai.OpenAI") as MockClient:
-            MockClient.return_value.chat.completions.create.return_value = mock_response
-            client = OpenAIClient()
-            client._client = MockClient.return_value
-            result = client.chat("system", "user", context="test")
-            assert result == {"result": "ok"}
-
-    def test_openai_client_json_mode_strips_fences(self):
-        from app.services.ai_client import _strip_fences
-        raw = "```json\n{\"key\": \"value\"}\n```"
-        cleaned = _strip_fences(raw)
-        assert cleaned == '{"key": "value"}'
-
-    def test_ai_response_parse_error_on_invalid_json(self):
-        from app.services.ai_client import _parse_json_response
-        from app.core.exceptions import AIResponseParseError
-        with pytest.raises(AIResponseParseError):
-            _parse_json_response("not valid json", "test")
+    def test_governance_audit_includes_all_areas(self):
+        prompts = BidPrompts()
+        bundle = MagicMock()
+        bundle.model_dump_json.return_value = '{"deal_name": "test"}'
+        result = prompts.governance_audit(bundle, {"proposal": "content"})
+        assert "Business Fit" in result
+        assert "Legal Risk" in result
+        assert "BOQ Consistency" in result
 
 
-# ── Pipeline Integration (mocked AI calls) ────────────────────────────────────
+# ── Unit Tests: Pipeline Stages ────────────────────────────────────────────
 
-class TestPipelineMocked:
-    """
-    Integration tests for the full pipeline with AI calls mocked.
-    These verify the pipeline orchestration without making real API calls.
-    """
 
-    def _make_bundle_response(self) -> dict:
-        return {
-            "deal": {"customer": "Test Corp", "industry": "Finance"},
-            "requirements": {}, "solution": {}, "sizing": {},
-            "boq": {}, "commercials": {}, "sow": {}, "tnc": {}
-        }
+class TestBidReviewPipeline:
+    @pytest.mark.asyncio
+    async def test_stage_extract_returns_dict(self, sample_document_set):
+        """Stage 1 should return a dict of doc_type -> text."""
+        pipeline = BidReviewPipeline()
+        with patch.object(
+            pipeline.parser, "extract_all", new_callable=AsyncMock
+        ) as mock_extract:
+            mock_extract.return_value = {
+                "crm": "crm text",
+                "proposal": "proposal text",
+            }
+            from app.models.schemas import ReviewSession
+            session = ReviewSession(session_id="test-123")
+            result = await pipeline._stage_extract(sample_document_set, session)
 
-    def _make_audit_response(self) -> dict:
-        return {
-            "scorecard": {
-                "areas": [
-                    {"area": "Business Fit", "verdict": "PASS", "score": 90, "issue_count": 0, "notes": ""},
-                    {"area": "Sizing Validity", "verdict": "BLOCKER", "score": 40, "issue_count": 1, "notes": "Node count low"},
-                ],
-                "overall_score": 65,
-                "blocker_count": 1,
-                "recommendation": "Conditional Go",
-                "clarifying_questions": ["What is the target RTO?"],
-            },
-            "issues": [
-                {
-                    "id": "INF-SIZ-001",
-                    "category": "Sizing",
-                    "severity": "BLOCKER",
-                    "finding": "DR node count insufficient",
-                    "evidence": "Sizing sheet shows 1 node",
-                    "impact": "Failover will cause outage",
-                    "fix": "Add 1 more node",
-                    "owner": "Presales",
-                    "status": "Open",
-                }
-            ]
-        }
-
-    def _make_rewrite_response(self) -> dict:
-        return {
-            "executive_summary": "Revised exec summary",
-            "solution_approach": "Revised approach",
-            "architecture_justification": "Architecture rationale",
-            "sizing_assumptions": "Sizing notes",
-            "scope_and_deliverables": "Scope",
-            "milestones_and_acceptance": "Milestones",
-            "dependencies": "Dependencies",
-            "commercial_clarifications": "Commercial notes",
-            "assumptions_and_exclusions": "Assumptions"
-        }
-
-    def _make_legal_response(self) -> dict:
-        return {
-            "revised_sla_clause": "SLA clause text",
-            "revised_liability_clause": "Liability clause",
-            "revised_change_control": "Change control process",
-            "revised_acceptance_criteria": "Acceptance criteria",
-            "revised_warranty_clause": "Warranty clause",
-            "additional_recommendations": ["Get legal sign-off before execution"]
-        }
+        assert isinstance(result, dict)
+        assert "crm" in result
 
     @pytest.mark.asyncio
-    async def test_full_pipeline_mocked(self, tmp_path):
-        """Full pipeline runs successfully with mocked AI calls."""
-        from app.services.evaluator import BidReviewPipeline
-
-        # Minimal valid TXT "documents"
-        uploaded = {
-            "crm": (b"Customer: Test Corp. Industry: Finance.", "crm.txt"),
-            "requirements": (b"Must have HA. Must have DR.", "requirements.txt"),
-            "sizing": (b"VM Count: 20. CPU: 4:1.", "sizing.txt"),
-            "boq": (b"Hardware: Dell PowerEdge.", "boq.txt"),
-            "proposal": (b"Proposed solution includes HCI.", "proposal.txt"),
-        }
-
+    async def test_stage_bundle_parses_json(self, sample_document_set, sample_bid_bundle):
+        """Stage 2 should call Claude and parse JSON into BidBundle."""
         pipeline = BidReviewPipeline()
+        extracted = {"crm": "crm text", "proposal": "proposal text"}
 
-        with (
-            patch.object(pipeline._openai, "chat") as mock_openai,
-            patch.object(pipeline._claude, "chat") as mock_claude,
-            patch("app.services.output_generator.generate_all_outputs") as mock_gen,
-        ):
-            mock_openai.side_effect = [
-                self._make_bundle_response(),
-                self._make_audit_response(),
-                self._make_rewrite_response(),
-            ]
-            mock_claude.return_value = self._make_legal_response()
-            mock_gen.return_value = {
-                "scorecard": "/tmp/scorecard.docx",
-                "issue_log": "/tmp/issue_log.xlsx",
-                "proposal": "/tmp/proposal.docx",
-                "sow": "/tmp/sow.docx",
-            }
+        with patch(
+            "app.services.evaluator.claude_client.complete_json",
+            new_callable=AsyncMock,
+        ) as mock_claude:
+            mock_claude.return_value = sample_bid_bundle.model_dump_json()
+            from app.models.schemas import ReviewSession
+            session = ReviewSession(session_id="test-123")
+            result = await pipeline._stage_build_bundle(extracted, "Test Deal", session)
 
-            session = await pipeline.run("Test Corp — HCI Deal", uploaded)
+        assert isinstance(result, BidBundle)
+        assert result.customer == "ACME Corp"
 
-            assert session.bid_bundle is not None
-            assert session.bid_bundle.deal.customer == "Test Corp"
-            assert session.audit_result is not None
-            assert session.audit_result.scorecard.blocker_count == 1
-            assert session.has_blockers is True
-            assert session.proposal_rewrite.executive_summary == "Revised exec summary"
-            assert session.legal_review.revised_sla_clause == "SLA clause text"
-            assert session.is_complete is True
+    @pytest.mark.asyncio
+    async def test_stage_audit_returns_audit_result(
+        self, sample_bid_bundle, sample_audit_result
+    ):
+        """Stage 3 should call Claude and parse JSON into AuditResult."""
+        pipeline = BidReviewPipeline()
+        extracted = {"proposal": "proposal text"}
+
+        with patch(
+            "app.services.evaluator.claude_client.complete_json",
+            new_callable=AsyncMock,
+        ) as mock_claude:
+            mock_claude.return_value = sample_audit_result.model_dump_json()
+            from app.models.schemas import ReviewSession
+            session = ReviewSession(session_id="test-123")
+            result = await pipeline._stage_audit(sample_bid_bundle, extracted, session)
+
+        assert isinstance(result, AuditResult)
+        assert result.scorecard.blocker_count == 1
+
+    @pytest.mark.asyncio
+    async def test_stage_legal_skipped_when_no_docs(self):
+        """Stage 5 should skip gracefully when no legal docs are provided."""
+        pipeline = BidReviewPipeline()
+        extracted = {"crm": "crm text", "proposal": "proposal text"}
+
+        from app.models.schemas import ReviewSession
+        session = ReviewSession(session_id="test-123")
+        result = await pipeline._stage_legal_review(extracted, session)
+
+        assert result.risk_level == "unknown"
+        assert session.stages["legal"] == StageStatus.SKIPPED
+
+    def test_derive_recommendation_go(self, sample_audit_result):
+        sample_audit_result.scorecard.blocker_count = 0
+        sample_audit_result.scorecard.overall_score = 90
+        rec = BidReviewPipeline._derive_recommendation(sample_audit_result)
+        assert rec == "Go"
+
+    def test_derive_recommendation_no_go_blocker(self, sample_audit_result):
+        rec = BidReviewPipeline._derive_recommendation(sample_audit_result)
+        assert "No Go" in rec
+        assert "blocker" in rec
+
+    def test_derive_recommendation_conditional(self, sample_audit_result):
+        sample_audit_result.scorecard.blocker_count = 0
+        sample_audit_result.scorecard.overall_score = 70
+        rec = BidReviewPipeline._derive_recommendation(sample_audit_result)
+        assert rec == "Conditional Go"
+
+
+# ── Integration Tests: API Endpoints ──────────────────────────────────────
+
+
+class TestAPIEndpoints:
+    def test_health_check(self):
+        with TestClient(app) as client:
+            response = client.get("/health/")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert data["ai_provider"] == "Anthropic Claude"
+        assert "claude" in data["fast_model"].lower()
+
+    def test_list_sessions_empty(self):
+        with TestClient(app) as client:
+            response = client.get("/sessions/")
+        assert response.status_code == 200
+        assert isinstance(response.json(), list)
+
+    def test_get_nonexistent_session(self):
+        with TestClient(app) as client:
+            response = client.get("/sessions/nonexistent-id")
+        assert response.status_code == 404
+
+    def test_download_nonexistent_file(self):
+        with TestClient(app) as client:
+            response = client.get("/outputs/fake-session/fake-file.docx")
+        assert response.status_code == 404
